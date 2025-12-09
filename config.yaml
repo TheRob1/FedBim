@@ -1,0 +1,74 @@
+# Federated Learning Configuration
+federated_learning:
+  server:
+    address: "127.0.0.1"
+    port: 8081
+    num_rounds: 10
+    num_clients: 2
+    min_available_clients: 2
+    strategy: "fedavg"
+    min_fit_clients: 2
+    min_evaluate_clients: 2
+    evaluate_fn: "weighted_average"
+
+# YOLOv8 Model Configuration
+yolo:
+  model: "yolov8n.pt"  # Using nano version for faster training, can be changed to larger models
+  epochs: 50
+  batch_size: 8
+  imgsz: 640
+  device: "0"  # 0 for GPU, "cpu" for CPU
+  workers: 4
+  optimizer: "auto"
+  lr0: 0.01
+  lrf: 0.01
+  momentum: 0.937
+  weight_decay: 0.0005
+  warmup_epochs: 3.0
+  warmup_momentum: 0.8
+  warmup_bias_lr: 0.1
+  box: 7.5  # box loss gain
+  cls: 0.5  # cls loss gain
+  dfl: 1.5  # dfl loss gain
+  fl_gamma: 0.0  # focal loss gamma
+  hsv_h: 0.015  # image HSV-Hue augmentation (fraction)
+  hsv_s: 0.7  # image HSV-Saturation augmentation (fraction)
+  hsv_v: 0.4  # image HSV-Value augmentation (fraction)
+  degrees: 0.0  # image rotation (+/- deg)
+  translate: 0.1  # image translation (+/- fraction)
+  scale: 0.5  # image scale (+/- gain)
+  shear: 0.0  # image shear (+/- deg)
+  perspective: 0.0  # image perspective (+/- fraction), range 0-0.001
+  flipud: 0.0  # image flip up-down (probability)
+  fliplr: 0.5  # image flip left-right (probability)
+  mosaic: 1.0  # image mosaic (probability)
+  mixup: 0.0  # image mixup (probability)
+  copy_paste: 0.0  # segment copy-paste (probability)
+
+# Dataset Configuration
+dataset:
+  train_path: "606_train_152_val_12_test/train"
+  val_path: "606_train_152_val_12_test/valid"
+  test_path: "606_train_152_val_12_test/test"
+  nc: 1  # number of classes (fire safety equipment)
+  names: ['fire_safety_equipment']  # class names
+  
+  # Data distribution settings
+  distribution:
+    method: "dirichlet"  # or "iid" for independent and identically distributed
+    alpha: 0.5  # concentration parameter for Dirichlet distribution (lower = more non-IID)
+    
+  # Directory structure
+  dir_structure:
+    images: "images"
+    labels: "labels"
+    cache: True  # whether to use cache for faster loading
+
+# Logging Configuration
+logging:
+  log_dir: "logs"
+  tensorboard: True
+  wandb: False
+  save_period: -1  # save checkpoint every x epochs (-1 to disable)
+  project: "fedbim-fire-safety"
+  name: "yolov8n_federated"

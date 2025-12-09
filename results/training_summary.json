@@ -1,0 +1,15 @@
+{
+  "training_start_time": "2025-12-05 03:46:31,598",
+  "training_duration": "0:17:23.759122",
+  "rounds_completed": 0,
+  "clients_connected": 2,
+  "model_metrics": {
+    "best_accuracy": 0,
+    "best_mAP50": 0,
+    "best_round": 0
+  },
+  "system_metrics": {
+    "cuda_available": false,
+    "device_used": "CPU"
+  }
+}
