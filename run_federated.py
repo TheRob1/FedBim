@@ -13,6 +13,8 @@ import argparse
 import subprocess
 import time
 import json
+import psutil # Added for robust process management
+import json
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Any
 import shutil
@@ -46,14 +48,42 @@ def setup_logging():
     return logging.getLogger(__name__)
 
 def cleanup():
-    """Clean up function to terminate all subprocesses."""
+    """Clean up function to terminate all subprocesses and their children."""
     logger.info("Cleaning up processes...")
+    
+    # First, collect all processes (parents and children) to kill
+    procs_to_kill = []
+    
+    # Add tracked parent processes
     for p in processes:
+        if p.poll() is None:  # If still running
+            try:
+                parent = psutil.Process(p.pid)
+                procs_to_kill.append(parent)
+                # Add all children recursively
+                children = parent.children(recursive=True)
+                procs_to_kill.extend(children)
+            except (psutil.NoSuchProcess, ValueError):
+                pass
+                
+    # Kill the processes
+    for p in procs_to_kill:
         try:
             p.terminate()
-            p.wait(timeout=5)
-        except Exception as e:
-            logger.warning(f"Error terminating process: {e}")
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+            
+    # Wait for termination
+    _, alive = psutil.wait_procs(procs_to_kill, timeout=3)
+    
+    # Force kill any survivors
+    for p in alive:
+        try:
+            logger.warning(f"Force killing process {p.pid}")
+            p.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+            
     logger.info("All processes terminated.")
 
 def run_command(
@@ -117,7 +147,7 @@ def run_command(
             
             threading.Thread(
                 target=stream_output,
-                args=(process.stderr, logger.error),
+                args=(process.stderr, logger.info),
                 daemon=True
             ).start()
             

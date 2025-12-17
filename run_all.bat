@@ -33,7 +33,7 @@ python -c "import torch, flwr, ultralytics" >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
     echo Installing required packages...
     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-    pip install ultralytics flwr numpy opencv-python Pillow matplotlib seaborn pandas tqdm pyyaml
+    pip install ultralytics flwr numpy opencv-python Pillow matplotlib seaborn pandas tqdm pyyaml psutil
     if %ERRORLEVEL% NEQ 0 (
         echo Failed to install required packages
         pause

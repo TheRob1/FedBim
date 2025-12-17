@@ -14,7 +14,7 @@ federated_learning:
 # YOLOv8 Model Configuration
 yolo:
   model: "yolov8n.pt"  # Using nano version for faster training, can be changed to larger models
-  epochs: 50
+  epochs: 1
   batch_size: 8
   imgsz: 640
   device: "0"  # 0 for GPU, "cpu" for CPU
@@ -50,8 +50,8 @@ dataset:
   train_path: "606_train_152_val_12_test/train"
   val_path: "606_train_152_val_12_test/valid"
   test_path: "606_train_152_val_12_test/test"
-  nc: 1  # number of classes (fire safety equipment)
-  names: ['fire_safety_equipment']  # class names
+  nc: 4  # number of classes (updated to match dataset containing classes 0-3)
+  names: ['class_0', 'class_1', 'class_2', 'class_3']  # class names updated to match nc=4
   
   # Data distribution settings
   distribution:

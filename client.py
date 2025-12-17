@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Union
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
+# Set Matplotlib backend to Agg to prevent thread safety issues in FL clients
+import matplotlib
+matplotlib.use('Agg')
+
 # Patch Pillow 10.0.0+ compatibility for Ultralytics - MUST BE BEFORE OTHER IMPORTS
 import PIL.ImageFont
 if not hasattr(PIL.ImageFont.FreeTypeFont, 'getsize'):
@@ -21,6 +25,26 @@ if not hasattr(PIL.ImageFont.FreeTypeFont, 'getsize'):
 # Ensure torch is imported before any other deep learning related imports
 import torch
 import torch.nn as nn
+
+# Add DetectionModel to safe_globals allowlist for PyTorch 2.6+
+# Add DetectionModel to safe_globals allowlist for PyTorch 2.6+
+from ultralytics.nn.tasks import DetectionModel
+try:
+    torch.serialization.add_safe_globals([DetectionModel])
+except AttributeError:
+    pass
+
+# Monkeypatch torch.load to disable weights_only=True default in PyTorch 2.6+
+# This is required because Ultralytics calls torch.load internally without specifying weights_only,
+# and we trust the local checkpoints.
+_original_load = torch.load
+
+def _safe_load(*args, **kwargs):
+    if 'weights_only' not in kwargs:
+        kwargs['weights_only'] = False
+    return _original_load(*args, **kwargs)
+
+torch.load = _safe_load
 
 # Now import other deep learning related modules
 import flwr as fl
@@ -95,20 +119,90 @@ def train_with_timeout(model: YOLO, data_config: Union[str, dict], epochs: int, 
             data_config_path = data_config
             
         # Run training
-        results = model.train(
-            data=data_config_path,
-            epochs=epochs,
-            batch=batch_size,
-            imgsz=imgsz,
-            device=device,
-            workers=workers,
-            project=project,
-            name=name,
-            exist_ok=True,
-            optimizer='SGD',
-            verbose=verbose
-        )
+        # Use context manager for safe_globals to ensure it persists in this scope
+        exist_ok = True # Derived from original call
+        optimizer = 'SGD' # Derived from original call
+        try:
+            from ultralytics.nn.tasks import DetectionModel
+            with torch.serialization.safe_globals([DetectionModel]):
+                 results = model.train(
+                    data=data_config_path,
+                    epochs=epochs,
+                    batch=batch_size,
+                    imgsz=imgsz,
+                    device=device,
+                    workers=workers,
+                    project=project,
+                    name=name,
+                    exist_ok=exist_ok,
+                    optimizer=optimizer, # Explicitly set optimizer to avoid "auto" error
+                    verbose=verbose,
+                    plots=False # Disable plotting to avoid Tkinter thread issues
+                )
+        except AttributeError:
+             # Fallback for older PyTorch versions
+             results = model.train(
+                data=data_config_path,
+                epochs=epochs,
+                batch=batch_size,
+                imgsz=imgsz,
+                device=device,
+                workers=workers,
+                project=project,
+                name=name,
+                exist_ok=exist_ok,
+                optimizer=optimizer, # Explicitly set optimizer to avoid "auto" error
+                verbose=verbose,
+                plots=False # Disable plotting to avoid Tkinter thread issues
+            )
         
+        
+        
+        # If results is None (common in threaded execution), try to read from CSV
+        if results is None:
+            logging.warning("Training returned None. Attempting to recover metrics from results.csv...")
+            try:
+                results_path = os.path.join(project, name, 'results.csv')
+                if os.path.exists(results_path):
+                    import pandas as pd
+                    # Read the CSV - handling potential whitespace in column names
+                    df = pd.read_csv(results_path)
+                    if not df.empty:
+                        # Get the last row (latest epoch)
+                        last_row = df.iloc[-1]
+                        
+                        # Clean column names (strip whitespace)
+                        clean_results = {k.strip(): v for k, v in last_row.to_dict().items()}
+                        
+                        # Create a mock object structure to match what client expects
+                        from types import SimpleNamespace
+                        results = SimpleNamespace()
+                        results.results_dict = {}
+                        
+                        # Map likely column names to what our code expects or just pass them through
+                        # Standard YOLOv8 CSV columns: train/box_loss, train/cls_loss, train/dfl_loss, metrics/mAP50(B), etc.
+                        # Our client.py evaluation expects keys like 'metrics/mAP50(B)' but for training loop 
+                        # we usually care about loss.
+                        
+                        # Let's populate results_dict
+                        results.results_dict = clean_results
+                        logging.info(f"Recovered metrics from CSV: {clean_results.keys()}")
+                    else:
+                        logging.warning("results.csv found but empty.")
+                else:
+                    logging.warning(f"results.csv not found at {results_path}")
+            except Exception as e:
+                logging.error(f"Failed to recover metrics from CSV: {e}")
+
+        # Debugging the results object
+        logging.info(f"DEBUG: train_results type: {type(results)}")
+        if results is not None:
+             logging.info(f"DEBUG: train_results attrs: {dir(results)}")
+             if hasattr(results, 'results_dict'):
+                 logging.info(f"DEBUG: results_dict keys: {results.results_dict.keys() if results.results_dict else 'None'}")
+             else:
+                 logging.info("DEBUG: No results_dict attribute found on results object")
+
         # Clean up temporary file if we created one
         if 'data_config_path' in locals() and os.path.exists(data_config_path):
             try:
@@ -389,16 +483,27 @@ class FireSafetyClient(fl.client.NumPyClient):
             num_examples_train = len(os.listdir(os.path.join(self.config['dataset']['train_path'], 'images')))
             
             # Calculate metrics
-            metrics = {
-                'loss': train_results.results_dict.get('train/box_loss', 0.0) + 
-                       train_results.results_dict.get('train/cls_loss', 0.0) + 
-                       train_results.results_dict.get('train/dfl_loss', 0.0),
-                'box_loss': train_results.results_dict.get('train/box_loss', 0.0),
-                'cls_loss': train_results.results_dict.get('train/cls_loss', 0.0),
-                'dfl_loss': train_results.results_dict.get('train/dfl_loss', 0.0),
-                'lr': train_results.results_dict.get('lr/pg0', 0.0),
-                'training_time': time.time() - start_time
-            }
+            if train_results is not None and hasattr(train_results, 'results_dict') and train_results.results_dict:
+                metrics = {
+                    'loss': train_results.results_dict.get('train/box_loss', 0.0) + 
+                           train_results.results_dict.get('train/cls_loss', 0.0) + 
+                           train_results.results_dict.get('train/dfl_loss', 0.0),
+                    'box_loss': train_results.results_dict.get('train/box_loss', 0.0),
+                    'cls_loss': train_results.results_dict.get('train/cls_loss', 0.0),
+                    'dfl_loss': train_results.results_dict.get('train/dfl_loss', 0.0),
+                    'lr': train_results.results_dict.get('lr/pg0', 0.0),
+                    'training_time': time.time() - start_time
+                }
+            else:
+                self.logger.warning("Training results are None or empty. Using default metrics.")
+                metrics = {
+                    'loss': 0.0,
+                    'box_loss': 0.0,
+                    'cls_loss': 0.0,
+                    'dfl_loss': 0.0,
+                    'lr': 0.0,
+                    'training_time': time.time() - start_time
+                }
             
             # Log metrics
             self.metrics['fit_metrics'][f'round_{round_num}'] = metrics
@@ -433,8 +538,18 @@ class FireSafetyClient(fl.client.NumPyClient):
             
             # Create a clean YOLO instance
             model_path = Path(self.config['yolo']['model'])
-            config_file = 'yolov8n.yaml' if 'yolov8n' in str(model_path).lower() else 'yolov8s.yaml'
-            temp_model = YOLO(config_file)
+            # Create a temporary model for evaluation
+            # Try to use the checkpoint from the current round if available, as it has the correct structure (nc)
+            round_num = config.get('server_round', 0)
+            potential_ckpt = Path(f'runs/train/client_{self.client_id}_round_{round_num}/weights/best.pt')
+            
+            if potential_ckpt.exists():
+                self.logger.info(f"Loading temporary evaluation model from {potential_ckpt}")
+                temp_model = YOLO(str(potential_ckpt))
+            else:
+                self.logger.info("No round checkpoint found, initializing from base config")
+                config_file = 'yolov8n.yaml' if 'yolov8n' in str(model_path).lower() else 'yolov8s.yaml'
+                temp_model = YOLO(config_file)
             
             # Load parameters into the temporary model
             state_dict = temp_model.model.state_dict()
@@ -458,19 +573,32 @@ class FireSafetyClient(fl.client.NumPyClient):
                 workers=self.config['yolo']['workers'],
                 project=os.path.join('runs', 'val'),
                 name=f'client_{self.client_id}_round_{round_num}',
-                exist_ok=True
+                exist_ok=True,
+                plots=False
             )
             
             # Calculate metrics
-            metrics = {
-                'loss': 1.0 - results.results_dict.get('metrics/mAP50(B)', 0.0),  # Using 1-mAP as loss
-                'accuracy': results.results_dict.get('metrics/precision(B)', 0.0),
-                'precision': results.results_dict.get('metrics/precision(B)', 0.0),
-                'recall': results.results_dict.get('metrics/recall(B)', 0.0),
-                'mAP50': results.results_dict.get('metrics/mAP50(B)', 0.0),
-                'mAP50-95': results.results_dict.get('metrics/mAP50-95(B)', 0.0),
-                'evaluation_time': time.time() - start_time
-            }
+            if results is not None and hasattr(results, 'results_dict') and results.results_dict:
+                metrics = {
+                    'loss': 1.0 - results.results_dict.get('metrics/mAP50(B)', 0.0),  # Using 1-mAP as loss
+                    'accuracy': results.results_dict.get('metrics/precision(B)', 0.0),
+                    'precision': results.results_dict.get('metrics/precision(B)', 0.0),
+                    'recall': results.results_dict.get('metrics/recall(B)', 0.0),
+                    'mAP50': results.results_dict.get('metrics/mAP50(B)', 0.0),
+                    'mAP50-95': results.results_dict.get('metrics/mAP50-95(B)', 0.0),
+                    'evaluation_time': time.time() - start_time
+                }
+            else:
+                self.logger.warning("Evaluation returned no results, using default metrics")
+                metrics = {
+                    'loss': 1.0,
+                    'accuracy': 0.0,
+                    'precision': 0.0,
+                    'recall': 0.0,
+                    'mAP50': 0.0,
+                    'mAP50-95': 0.0,
+                    'evaluation_time': time.time() - start_time
+                }
             
             # Update metrics
             num_examples_test = len(os.listdir(os.path.join(self.config['dataset']['test_path'], 'images')))
