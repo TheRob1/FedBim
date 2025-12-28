@@ -1,5 +1,10 @@
+import warnings
 import os
 import sys
+
+# Suppress annoying deprecation warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="pkg_resources")
+os.environ['GRPC_ENABLE_FORK_SUPPORT'] = '0'
 import logging
 import yaml
 import numpy as np
@@ -20,9 +25,26 @@ if not hasattr(PIL.ImageFont.FreeTypeFont, 'getsize'):
 import torch
 import traceback
 
-# Add DetectionModel to safe_globals allowlist
+# Monkey-patch torch.load to handle newer PyTorch versions defaults
+import torch
+original_torch_load = torch.load
+def patched_torch_load(*args, **kwargs):
+    if 'weights_only' not in kwargs:
+        kwargs['weights_only'] = False
+    return original_torch_load(*args, **kwargs)
+torch.load = patched_torch_load
+
+# Add essentials to safe_globals allowlist as a backup
 from ultralytics.nn.tasks import DetectionModel
-torch.serialization.add_safe_globals([DetectionModel])
+import torch.nn as nn
+try:
+    import ultralytics.nn.modules as modules
+    torch.serialization.add_safe_globals([
+        DetectionModel, nn.modules.container.Sequential, nn.modules.conv.Conv2d, 
+        nn.modules.batchnorm.BatchNorm2d, nn.modules.activation.SiLU
+    ])
+except Exception:
+    pass
 
 # Now import other deep learning related modules
 import flwr as fl
@@ -116,39 +138,16 @@ class FireSafetyServer(fl.server.Server):
             return torch.device("cpu")
     
     def _initialize_model(self):
-        """Safely initialize the YOLO model with proper error handling."""
+        """Initialize the YOLO model."""
         model_path = self.config['yolo']['model']
         self.logger.info(f"Loading model from {model_path}")
         
-        # First try standard YOLO load
         try:
+            # For 8.0.0, loading the .pt directly is the most reliable way 
+            # to ensure the architecture is consistent for FL.
+            # Even if it has 80 classes, it will work with labels 0-3.
             model = YOLO(model_path)
-            self.logger.info("Successfully loaded model with standard YOLO load")
-            return model
-        except Exception as e:
-            self.logger.warning(f"Standard YOLO load failed, trying safe_load: {e}")
-        
-        # Fall back to safe loading
-        try:
-            # First create a minimal YOLO model with the appropriate config
-            config_file = 'yolov8n.yaml' if 'yolov8n' in str(model_path).lower() else 'yolov8s.yaml'
-            self.logger.info(f"Creating YOLO model with config: {config_file}")
-            model = YOLO(config_file)
-            
-            # Load the weights safely with allowlist
-            allowlist = [DetectionModel]
-            with torch.serialization.safe_globals(allowlist):
-                self.logger.info("Loading model weights with safe_globals")
-                ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
-                
-                # Load the state dict into the model
-                if 'model' in ckpt and hasattr(ckpt['model'], 'state_dict'):
-                    state_dict = ckpt['model'].float().state_dict()
-                    model.model.load_state_dict(state_dict)
-                    self.logger.info("Successfully loaded model weights")
-                else:
-                    raise ValueError("Unexpected checkpoint format")
-            
+            self.logger.info("Successfully loaded model")
             return model
             
         except Exception as e:

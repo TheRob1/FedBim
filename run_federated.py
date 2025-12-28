@@ -3,8 +3,13 @@
 Run script for federated learning with YOLOv8 and Flower.
 Handles data distribution, server, and client processes.
 """
+import warnings
 import os
 import sys
+
+# Suppress annoying deprecation warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="pkg_resources")
+os.environ['GRPC_ENABLE_FORK_SUPPORT'] = '0'
 import yaml
 import random
 import torch
@@ -163,26 +168,32 @@ def distribute_data_dirichlet(
     # Create output directories
     os.makedirs(output_dir, exist_ok=True)
     
-    # Get list of classes (assuming each subdirectory in train is a class)
+    # Get images and their classes by reading label files
     train_dir = os.path.join(base_dir, 'train')
-    class_dirs = [d for d in os.listdir(os.path.join(train_dir, 'images')) 
-                 if os.path.isdir(os.path.join(train_dir, 'images', d))]
+    img_dir = os.path.join(train_dir, 'images')
+    lbl_dir = os.path.join(train_dir, 'labels')
     
-    if not class_dirs:
-        # If no class directories, treat all images as one class
-        class_dirs = ['all_classes']
-        all_images = [f for f in os.listdir(os.path.join(train_dir, 'images')) 
-                     if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-        class_images = {'all_classes': all_images}
-    else:
-        # Get images per class
-        class_images = {}
-        for class_dir in class_dirs:
-            class_path = os.path.join(train_dir, 'images', class_dir)
-            class_images[class_dir] = [
-                os.path.join(class_dir, f) for f in os.listdir(class_path)
-                if f.lower().endswith(('.png', '.jpg', '.jpeg'))
-            ]
+    all_images = [f for f in os.listdir(img_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+    class_images = {}
+    
+    logger.info("Scanning labels to determine class distribution...")
+    for img_name in all_images:
+        label_name = os.path.splitext(img_name)[0] + '.txt'
+        label_path = os.path.join(lbl_dir, label_name)
+        
+        assigned_class = 'unknown'
+        if os.path.exists(label_path):
+            with open(label_path, 'r') as f:
+                first_line = f.readline().strip()
+                if first_line:
+                    assigned_class = first_line.split()[0]
+        
+        if assigned_class not in class_images:
+            class_images[assigned_class] = []
+        class_images[assigned_class].append(img_name)
+    
+    class_names = sorted(class_images.keys())
+    logger.info(f"Found {len(class_names)} classes: {class_names}")
     
     # Generate Dirichlet distribution for each class
     client_distributions = {}
@@ -218,19 +229,11 @@ def distribute_data_dirichlet(
             selected_images = random.sample(images, num_images)
             
             # Copy images and labels
-            for img_rel_path in selected_images:
-                # Handle both flat and class-based directory structures
-                if class_name == 'all_classes':
-                    img_name = img_rel_path
-                    class_subdir = ''
-                else:
-                    img_name = os.path.basename(img_rel_path)
-                    class_subdir = class_name
-                
+            for img_name in selected_images:
                 # Source paths
-                src_img = os.path.join(train_dir, 'images', class_subdir, img_name)
+                src_img = os.path.join(train_dir, 'images', img_name)
                 label_name = os.path.splitext(img_name)[0] + '.txt'
-                src_label = os.path.join(train_dir, 'labels', class_subdir, label_name)
+                src_label = os.path.join(train_dir, 'labels', label_name)
                 
                 # Destination paths
                 dst_img = os.path.join(client_dir, 'train', 'images', img_name)
@@ -273,7 +276,7 @@ def start_server():
     """Start the federated learning server."""
     try:
         config = load_config()
-        server_cmd = f"python server.py --config config.yaml"
+        server_cmd = f"{sys.executable} server.py --config config.yaml"
         logger.info("Starting federated learning server...")
         return run_command(server_cmd, wait=False, log_prefix="[SERVER] ")
     except Exception as e:
@@ -284,7 +287,7 @@ def start_client(client_id: int, config_path: str = 'config.yaml'):
     """Start a federated learning client."""
     try:
         config = load_config(config_path)
-        client_cmd = f"python client.py --cid {client_id} --config {config_path}"
+        client_cmd = f"{sys.executable} client.py --cid {client_id} --config {config_path}"
         logger.info(f"Starting client {client_id}...")
         return run_command(client_cmd, wait=False, log_prefix=f"[CLIENT-{client_id}] ")
     except Exception as e:
@@ -331,8 +334,8 @@ def main():
         parser = argparse.ArgumentParser(description='Run federated learning with YOLOv8 and Flower')
         parser.add_argument('--num-clients', type=int, default=2, help='Number of clients to start')
         parser.add_argument('--distribute-data', action='store_true', help='Distribute data among clients')
-        parser.add_argument('--data-dir', type=str, default='data', help='Base directory for data')
-        parser.add_argument('--output-dir', type=str, default='client_data', help='Output directory for client data')
+        parser.add_argument('--data-dir', type=str, default='606_train_152_val_12_test', help='Base directory for data')
+        parser.add_argument('--output-dir', type=str, default='data', help='Output directory for client data')
         parser.add_argument('--alpha', type=float, default=0.5, help='Dirichlet distribution parameter')
         parser.add_argument('--seed', type=int, default=42, help='Random seed')
         parser.add_argument('--config', type=str, default='config.yaml', help='Path to config file')

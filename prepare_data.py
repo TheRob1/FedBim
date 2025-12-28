@@ -137,7 +137,7 @@ if __name__ == "__main__":
     )
     
     # Create dataset YAML file
-    class_names = ['fire_safety_equipment']  # Update with your actual class names
+    class_names = ['blanket', 'call_point', 'detector', 'extinguisher']
     create_data_yaml(
         dataset_dir=args.base_dir,
         output_path=os.path.join(args.base_dir, 'data.yaml'),
