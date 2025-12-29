@@ -124,17 +124,20 @@ class FireSafetyServer(fl.server.Server):
     
     def _initialize_device(self) -> torch.device:
         """Initialize and verify PyTorch device."""
-        if not torch.cuda.is_available():
-            self.logger.warning("CUDA not available, using CPU. Training will be slow.")
-            return torch.device("cpu")
-        
+        device_config = str(self.config['yolo'].get('device', '0'))
         try:
-            # Try to allocate and free a tensor to verify CUDA is working
-            _ = torch.tensor([1.0]).cuda()
-            self.logger.info("CUDA is available and working")
-            return torch.device("cuda:0")
+            # If CUDA_VISIBLE_DEVICES is set by the runner, 'cuda:0' refers to that specific GPU.
+            if torch.cuda.is_available() and device_config != 'cpu':
+                device = torch.device("cuda:0")
+                # Test CUDA to verify it's working
+                _ = torch.tensor([1.0]).to(device)
+                self.logger.info(f"Using CUDA device: {torch.cuda.get_device_name(device)}")
+            else:
+                device = torch.device("cpu")
+                self.logger.warning("Using CPU for training. This will be slow.")
+            return device
         except Exception as e:
-            self.logger.warning(f"CUDA initialization failed: {str(e)}. Falling back to CPU.")
+            self.logger.warning(f"Device initialization failed: {str(e)}. Falling back to CPU.")
             return torch.device("cpu")
     
     def _initialize_model(self):
@@ -147,7 +150,8 @@ class FireSafetyServer(fl.server.Server):
             # to ensure the architecture is consistent for FL.
             # Even if it has 80 classes, it will work with labels 0-3.
             model = YOLO(model_path)
-            self.logger.info("Successfully loaded model")
+            model.to(self.device)
+            self.logger.info(f"Successfully loaded model and moved to {self.device}")
             return model
             
         except Exception as e:
@@ -201,6 +205,7 @@ class FireSafetyServer(fl.server.Server):
     
     def get_fit_config(self, server_round: int) -> Dict[str, Scalar]:
         """Return training configuration for each round."""
+        self.logger.info(f"Sending fit configuration for round {server_round} to clients...")
         return {
             "epochs": self.config['yolo']['epochs'],
             "batch_size": self.config['yolo']['batch_size'],
@@ -226,9 +231,8 @@ class FireSafetyServer(fl.server.Server):
             # Layer fusion (merging BN into Conv) happens during validation/prediction and changes
             # the model structure (225 -> 168 layers), incorrectly updating the persistent model.
             
-            # Create a new YOLO instance with the same config
-            config_file = 'yolov8n.yaml' if 'yolov8n' in str(self.config['yolo']['model']).lower() else 'yolov8s.yaml'
-            temp_model = YOLO(config_file)
+            # Create a new YOLO instance with the same model to ensure architecture matches
+            temp_model = YOLO(self.config['yolo']['model'])
             
             # Start with the main model's state dict (unfused)
             model_state_dict = temp_model.model.state_dict()
@@ -274,10 +278,10 @@ class FireSafetyServer(fl.server.Server):
             with torch.no_grad():  # Ensure no gradients are computed during evaluation
                 # Create a temporary YAML config file for validation
                 val_config = {
-                    'path': os.getcwd(),  # Use current directory as base
-                    'train': None,
-                    'val': self.config['dataset']['val_path'],
-                    'test': self.config['dataset']['test_path'],
+                    'path': str(Path().absolute()),
+                    'train': str(Path(self.config['dataset']['train_path']).absolute() / 'images'),
+                    'val': str(Path(self.config['dataset']['val_path']).absolute() / 'images'),
+                    'test': str(Path(self.config['dataset']['test_path']).absolute() / 'images'),
                     'nc': self.config['dataset']['nc'],
                     'names': self.config['dataset']['names']
                 }
@@ -290,36 +294,48 @@ class FireSafetyServer(fl.server.Server):
                 
                 try:
                     # Run validation on the TEMPORARY model
+                    self.logger.info(f"Running validation on {temp_config_path}...")
                     results = eval_model.val(
                         data=temp_config_path,
                         batch=self.config['yolo']['batch_size'],
                         imgsz=self.config['yolo']['imgsz'],
                         device=str(self.device).replace('cuda:', ''),  # Remove 'cuda:' prefix if present
-                        workers=self.config['yolo']['workers'],
+                        workers=0,
                         project=os.path.join('runs', 'eval'),
                         name=f'round_{server_round}',
-                        verbose=False
+                        verbose=True
                     )
                     
                     if results is None: 
-                        raise ValueError("Validation returned None")
+                        # Try to retrieve metrics from the validator if val() returned None
+                        if hasattr(eval_model, 'validator') and eval_model.validator is not None:
+                            results = eval_model.validator.metrics
+                        else:
+                            self.logger.warning("Validation failed to return results. Using dummy metrics to allow training to proceed.")
+                            results = {
+                                'metrics/precision(B)': 0.0,
+                                'metrics/recall(B)': 0.0,
+                                'metrics/mAP50(B)': 0.0,
+                                'metrics/mAP50-95(B)': 0.0
+                            }
 
-                    # Extract metrics
-                    # Note: indices depend on the exact return format of YOLOv8 val
-                    # YOLOv8 val returns a DetMetrics object
-                    
+                    # Extract metrics safely
+                    val_metrics = getattr(results, 'results_dict', results) if results is not None else {}
+                    if not isinstance(val_metrics, dict):
+                        val_metrics = {}
+
                     # Log validation results
                     self.logger.info(f"Round {server_round} evaluation results:")
-                    self.logger.info(f"mAP50: {results.results_dict.get('metrics/mAP50(B)', 0.0)}")
-                    self.logger.info(f"mAP50-95: {results.results_dict.get('metrics/mAP50-95(B)', 0.0)}")
+                    self.logger.info(f"mAP50: {val_metrics.get('metrics/mAP50(B)', 0.0)}")
+                    self.logger.info(f"mAP50-95: {val_metrics.get('metrics/mAP50-95(B)', 0.0)}")
                     
                     metrics = {
-                        "loss": float(1.0 - results.results_dict.get('metrics/mAP50(B)', 0.0)),  # Using 1-mAP as loss
-                        "accuracy": float(results.results_dict.get('metrics/precision(B)', 0.0)),
-                        "precision": float(results.results_dict.get('metrics/precision(B)', 0.0)),
-                        "recall": float(results.results_dict.get('metrics/recall(B)', 0.0)),
-                        "mAP50": float(results.results_dict.get('metrics/mAP50(B)', 0.0)),
-                        "mAP50-95": float(results.results_dict.get('metrics/mAP50-95(B)', 0.0)),
+                        "loss": float(1.0 - val_metrics.get('metrics/mAP50(B)', 0.0)),  # Using 1-mAP as loss
+                        "accuracy": float(val_metrics.get('metrics/precision(B)', 0.0)),
+                        "precision": float(val_metrics.get('metrics/precision(B)', 0.0)),
+                        "recall": float(val_metrics.get('metrics/recall(B)', 0.0)),
+                        "mAP50": float(val_metrics.get('metrics/mAP50(B)', 0.0)),
+                        "mAP50-95": float(val_metrics.get('metrics/mAP50-95(B)', 0.0)),
                     }
                 finally:
                     # Clean up the temporary config file
@@ -328,11 +344,36 @@ class FireSafetyServer(fl.server.Server):
                             os.unlink(temp_config_path)
                     except Exception as e:
                         self.logger.warning(f"Failed to clean up temporary config file: {e}")
+            
+            # Save the global model
+            try:
+                model_path = os.path.join(self.results_dir, f'global_model_round_{server_round}.pt')
+                # Ensure model is on CPU before saving
+                original_device = next(self.global_model.model.parameters()).device
+                self.global_model.model.to('cpu')
+                torch.save(self.global_model.model.state_dict(), model_path)
+                # Move model back to original device
+                self.global_model.model.to(original_device)
+                self.logger.info(f"Saved global model to {model_path}")
+            except Exception as e:
+                self.logger.error(f"Error saving model: {str(e)}")
+            
+            # Log and save metrics
+            self.metrics[f'round_{server_round}'] = metrics
+            log_round_metrics(server_round, metrics, is_global=True)
+            save_metrics(self.metrics, os.path.join(self.results_dir, 'training_metrics.json'))
+            
+            # Generate plots
+            plot_metrics(self.metrics, os.path.join(self.results_dir, 'plots'))
+            
+            # Return loss and metrics
+            return metrics["loss"], metrics
+
         except Exception as e:
             self.logger.error(f"Error during model evaluation: {str(e)}")
             self.logger.error(traceback.format_exc())
             # Return default metrics in case of error
-            return 1.0, {
+            error_metrics = {
                 "loss": 1.0,
                 "accuracy": 0.0,
                 "precision": 0.0,
@@ -340,41 +381,7 @@ class FireSafetyServer(fl.server.Server):
                 "mAP50": 0.0,
                 "mAP50-95": 0.0,
             }
-        
-        # Save the global model
-        try:
-            model_path = os.path.join(self.results_dir, f'global_model_round_{server_round}.pt')
-            # Ensure model is on CPU before saving
-            original_device = next(self.global_model.model.parameters()).device
-            self.global_model.model.to('cpu')
-            torch.save(self.global_model.model.state_dict(), model_path)
-            # Move model back to original device
-            self.global_model.model.to(original_device)
-            self.logger.info(f"Saved global model to {model_path}")
-        except Exception as e:
-            self.logger.error(f"Error saving model: {str(e)}")
-            # Continue even if saving fails
-        
-        # Calculate metrics
-        metrics = {
-            "loss": float(1.0 - results.results_dict.get('metrics/mAP50(B)', 0.0)),  # Using 1-mAP as loss
-            "accuracy": float(results.results_dict.get('metrics/precision(B)', 0.0)),
-            "precision": float(results.results_dict.get('metrics/precision(B)', 0.0)),
-            "recall": float(results.results_dict.get('metrics/recall(B)', 0.0)),
-            "mAP50": float(results.results_dict.get('metrics/mAP50(B)', 0.0)),
-            "mAP50-95": float(results.results_dict.get('metrics/mAP50-95(B)', 0.0)),
-        }
-        
-        # Log and save metrics
-        self.metrics[f'round_{server_round}'] = metrics
-        log_round_metrics(server_round, metrics, is_global=True)
-        save_metrics(self.metrics, os.path.join(self.results_dir, 'training_metrics.json'))
-        
-        # Generate plots
-        plot_metrics(self.metrics, os.path.join(self.results_dir, 'plots'))
-        
-        # Return loss and metrics
-        return metrics["loss"], metrics
+            return 1.0, error_metrics
 
 def main():
     try:

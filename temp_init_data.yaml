@@ -1,0 +1,8 @@
+names:
+- blanket
+- call_point
+- detector
+- extinguisher
+nc: 4
+train: 606_train_152_val_12_test/train/images
+val: 606_train_152_val_12_test/valid/images

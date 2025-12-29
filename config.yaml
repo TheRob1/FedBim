@@ -2,8 +2,8 @@
 federated_learning:
   server:
     address: "127.0.0.1"
-    port: 8081
-    num_rounds: 10
+    port: 12001
+    num_rounds: 100
     num_clients: 2
     min_available_clients: 2
     strategy: "fedavg"
@@ -13,11 +13,11 @@ federated_learning:
 
 # YOLOv8 Model Configuration
 yolo:
-  model: "yolov8n.pt"  # Using nano version for faster training, can be changed to larger models
+  model: "yolov8n_nc4.pt"  # Using custom 4-class base model to ensure architecture consistency
   epochs: 1
   batch_size: 8
   imgsz: 640
-  device: "0"  # 0 for GPU, "cpu" for CPU
+  device: "6"  # 0 for GPU, "cpu" for CPU
   workers: 4
   optimizer: "auto"
   lr0: 0.01

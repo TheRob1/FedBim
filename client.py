@@ -192,19 +192,22 @@ class FireSafetyClient(fl.client.NumPyClient):
             raise RuntimeError(f"Client initialization failed: {str(e)}")
     
     def _initialize_device(self) -> torch.device:
-        """Initialize and verify PyTorch device with fallback to CPU if CUDA fails."""
+        """Initialize and verify PyTorch device."""
+        device_config = str(self.config['yolo'].get('device', '0'))
         try:
-            if torch.cuda.is_available():
-                # Test CUDA with a small tensor to verify it's working
-                _ = torch.tensor([1.0]).cuda()
-                device = torch.device(f"cuda:0")
-                self.logger.info(f"Using CUDA device: {torch.cuda.get_device_name(0)}")
+            # If CUDA_VISIBLE_DEVICES is set, 'cuda:0' always refers to the first visible GPU
+            # even if that was originally GPU 6.
+            if torch.cuda.is_available() and device_config != 'cpu':
+                device = torch.device("cuda:0")
+                # Test CUDA to verify it's working
+                _ = torch.tensor([1.0]).to(device)
+                self.logger.info(f"Using CUDA device: {torch.cuda.get_device_name(device)}")
             else:
                 device = torch.device("cpu")
-                self.logger.warning("CUDA not available, using CPU. Training will be slow.")
+                self.logger.warning("Using CPU for training. This will be slow.")
             return device
         except Exception as e:
-            self.logger.warning(f"CUDA initialization failed: {str(e)}. Falling back to CPU.")
+            self.logger.warning(f"Device initialization failed: {str(e)}. Falling back to CPU.")
             return torch.device("cpu")
     
     def _initialize_model(self) -> YOLO:
@@ -215,7 +218,9 @@ class FireSafetyClient(fl.client.NumPyClient):
         try:
             # We use the standard YOLO load to match the server.
             model = YOLO(str(model_path))
-            self.logger.info("Successfully loaded model")
+            # Explicitly move model to device to avoid weight/input mismatch
+            model.to(self.device)
+            self.logger.info(f"Successfully loaded model and moved to {self.device}")
             return model
             
         except Exception as e:
@@ -286,9 +291,9 @@ class FireSafetyClient(fl.client.NumPyClient):
     def _create_data_yaml(self) -> str:
         """Create a temporary data.yaml file for YOLO training."""
         data = {
-            'train': os.path.join('data', f'client_{self.client_id}', 'train'),
-            'val': os.path.join('data', f'client_{self.client_id}', 'valid'),
-            'test': self.config['dataset']['test_path'],
+            'train': str(Path(f'data/client_{self.client_id}/train/images').absolute()),
+            'val': str(Path(f'data/client_{self.client_id}/valid/images').absolute()),
+            'test': str(Path(self.config['dataset']['test_path']).absolute() / 'images'),
             'nc': self.config['dataset']['nc'],
             'names': self.config['dataset']['names']
         }
@@ -370,9 +375,10 @@ class FireSafetyClient(fl.client.NumPyClient):
                     batch_size=batch_size,
                     imgsz=imgsz,
                     device=str(self.device).replace('cuda:', ''),
-                    workers=workers,
+                    workers=0, # Set to 0 for increased stability in multi-tenant environments
                     project=project,
-                    name=name
+                    name=name,
+                    verbose=True
                 )
                 
                 try:
@@ -384,17 +390,66 @@ class FireSafetyClient(fl.client.NumPyClient):
             
             # Get the updated parameters
             parameters_prime = self.get_parameters(config={})
-            num_examples_train = len(os.listdir(os.path.join(self.config['dataset']['train_path'], 'images')))
             
-            # Calculate metrics
+            # Count local training examples
+            local_train_dir = os.path.join('data', f'client_{self.client_id}', 'train', 'images')
+            num_examples_train = len(os.listdir(local_train_dir)) if os.path.exists(local_train_dir) else 0
+            
+            # Calculate metrics safely (YOLOv8.0.0 might return None)
+            train_metrics = getattr(train_results, 'results_dict', {}) if train_results else {}
+            
+            # Try to recover metrics from the model object if results_dict is missing
+            if not train_metrics and hasattr(self.model, 'trainer') and self.model.trainer is not None:
+                trainer = self.model.trainer
+                loss_items = None
+                
+                # Check for label_loss_items (can be attribute or method)
+                labels = None
+                if hasattr(trainer, 'label_loss_items'):
+                    labels = trainer.label_loss_items
+                    if callable(labels):
+                        labels = labels()
+                
+                # Check for loss_items (values)
+                values = None
+                if hasattr(trainer, 'loss_items'):
+                    values = trainer.loss_items
+                    if callable(values):
+                        values = values()
+                
+                # If we have both labels and values, and they match in length, create a dict
+                if labels is not None and values is not None and len(labels) == len(values):
+                    train_metrics = {f"train/{l}" if not isinstance(l, str) or not l.startswith("train/") else l: float(v) 
+                                   for l, v in zip(labels, values)}
+                
+                # Fallback 1: If labels actually contains numeric values (old behavior)
+                elif labels is not None and len(labels) > 0 and not isinstance(labels[0], str):
+                    train_metrics = {
+                        'train/box_loss': float(labels[0]) if len(labels) > 0 else 0.0,
+                        'train/cls_loss': float(labels[1]) if len(labels) > 1 else 0.0,
+                        'train/dfl_loss': float(labels[2]) if len(labels) > 2 else 0.0,
+                    }
+                
+                # Fallback 2: Check for trainer.metrics
+                elif hasattr(trainer, 'metrics') and isinstance(trainer.metrics, dict):
+                    train_metrics = trainer.metrics
+                
+                # Fallback 3: If we have values but no labels, assume standard YOLO order
+                elif values and len(values) >= 3:
+                    train_metrics = {
+                        'train/box_loss': float(values[0]),
+                        'train/cls_loss': float(values[1]),
+                        'train/dfl_loss': float(values[2]),
+                    }
+
             metrics = {
-                'loss': train_results.results_dict.get('train/box_loss', 0.0) + 
-                       train_results.results_dict.get('train/cls_loss', 0.0) + 
-                       train_results.results_dict.get('train/dfl_loss', 0.0),
-                'box_loss': train_results.results_dict.get('train/box_loss', 0.0),
-                'cls_loss': train_results.results_dict.get('train/cls_loss', 0.0),
-                'dfl_loss': train_results.results_dict.get('train/dfl_loss', 0.0),
-                'lr': train_results.results_dict.get('lr/pg0', 0.0),
+                'loss': float(train_metrics.get('train/box_loss', 0.0) + 
+                             train_metrics.get('train/cls_loss', 0.0) + 
+                             train_metrics.get('train/dfl_loss', 0.0)),
+                'box_loss': float(train_metrics.get('train/box_loss', 0.0)),
+                'cls_loss': float(train_metrics.get('train/cls_loss', 0.0)),
+                'dfl_loss': float(train_metrics.get('train/dfl_loss', 0.0)),
+                'lr': float(train_metrics.get('lr/pg0', 0.0)),
                 'training_time': time.time() - start_time
             }
             
@@ -429,10 +484,8 @@ class FireSafetyClient(fl.client.NumPyClient):
             # We use a TEMPORARY model for evaluation to prevent layer fusion
             # which happens during val() and modifies the model structure permanently
             
-            # Create a clean YOLO instance
-            model_path = Path(self.config['yolo']['model'])
-            config_file = 'yolov8n.yaml' if 'yolov8n' in str(model_path).lower() else 'yolov8s.yaml'
-            temp_model = YOLO(config_file)
+            # Create a new YOLO instance with the same model to ensure architecture matches
+            temp_model = YOLO(str(self.config['yolo']['model']))
             
             # Load parameters into the temporary model
             state_dict = temp_model.model.state_dict()
@@ -453,25 +506,32 @@ class FireSafetyClient(fl.client.NumPyClient):
                 batch=config.get("batch_size", self.config['yolo']['batch_size']),
                 imgsz=self.config['yolo']['imgsz'],
                 device=str(self.device).replace('cuda:', ''),
-                workers=self.config['yolo']['workers'],
+                workers=0,
                 project=os.path.join('runs', 'val'),
                 name=f'client_{self.client_id}_round_{round_num}',
                 exist_ok=True
             )
             
-            # Calculate metrics
+            # Calculate metrics safely (YOLOv8.0.0 might return None)
+            val_metrics = getattr(results, 'results_dict', {}) if results else {}
+            
+            # Try to recover metrics from the model object if results_dict is missing
+            if not val_metrics and hasattr(temp_model, 'validator') and temp_model.validator is not None:
+                val_metrics = temp_model.validator.metrics
+
             metrics = {
-                'loss': 1.0 - results.results_dict.get('metrics/mAP50(B)', 0.0),  # Using 1-mAP as loss
-                'accuracy': results.results_dict.get('metrics/precision(B)', 0.0),
-                'precision': results.results_dict.get('metrics/precision(B)', 0.0),
-                'recall': results.results_dict.get('metrics/recall(B)', 0.0),
-                'mAP50': results.results_dict.get('metrics/mAP50(B)', 0.0),
-                'mAP50-95': results.results_dict.get('metrics/mAP50-95(B)', 0.0),
+                'loss': float(1.0 - val_metrics.get('metrics/mAP50(B)', 0.0)),  # Using 1-mAP as loss
+                'accuracy': float(val_metrics.get('metrics/precision(B)', 0.0)),
+                'precision': float(val_metrics.get('metrics/precision(B)', 0.0)),
+                'recall': float(val_metrics.get('metrics/recall(B)', 0.0)),
+                'mAP50': float(val_metrics.get('metrics/mAP50(B)', 0.0)),
+                'mAP50-95': float(val_metrics.get('metrics/mAP50-95(B)', 0.0)),
                 'evaluation_time': time.time() - start_time
             }
             
-            # Update metrics
-            num_examples_test = len(os.listdir(os.path.join(self.config['dataset']['test_path'], 'images')))
+            # Use local validation images for counting
+            local_val_dir = os.path.join('data', f'client_{self.client_id}', 'valid', 'images')
+            num_examples_test = len(os.listdir(local_val_dir)) if os.path.exists(local_val_dir) else 0
             self.metrics['evaluate_metrics'][f'round_{round_num}'] = metrics
             
             # Log metrics
@@ -603,13 +663,3 @@ if __name__ == "__main__":
         logger.error(f"Client error: {str(e)}", exc_info=True)
         sys.exit(1)
 
-    try:
-        # Set up logging
-        logger = setup_logging()
-        logger.info(f"Starting client {args.cid} and connecting to server at {args.server_address}")
-        
-    except KeyboardInterrupt:
-        logger.info("Client stopped by user")
-    except Exception as e:
-        logger.error(f"Client error: {str(e)}", exc_info=True)
-        raise

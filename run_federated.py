@@ -121,8 +121,8 @@ def run_command(
             ).start()
             
             threading.Thread(
-                target=stream_output,
-                args=(process.stderr, logger.error),
+                target=stream_output, 
+                args=(process.stderr, logger.info),
                 daemon=True
             ).start()
             
@@ -276,9 +276,37 @@ def start_server():
     """Start the federated learning server."""
     try:
         config = load_config()
+        device = str(config['yolo'].get('device', '0'))
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        if device != 'cpu':
+            env["CUDA_VISIBLE_DEVICES"] = device
+        
         server_cmd = f"{sys.executable} server.py --config config.yaml"
-        logger.info("Starting federated learning server...")
-        return run_command(server_cmd, wait=False, log_prefix="[SERVER] ")
+        logger.info(f"Starting federated learning server on GPU {device}...")
+        
+        process = subprocess.Popen(
+            server_cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
+            env=env
+        )
+        
+        # Monitor output in a thread
+        def stream_output(pipe, log_prefix):
+            for line in iter(pipe.readline, ''):
+                logger.info(f"{log_prefix}{line.strip()}")
+            pipe.close()
+            
+        threading.Thread(target=stream_output, args=(process.stdout, "[SERVER] "), daemon=True).start()
+        threading.Thread(target=stream_output, args=(process.stderr, "[SERVER] "), daemon=True).start()
+        
+        processes.append(process)
+        return process, None
     except Exception as e:
         logger.error(f"Failed to start server: {e}", exc_info=True)
         raise
@@ -287,9 +315,37 @@ def start_client(client_id: int, config_path: str = 'config.yaml'):
     """Start a federated learning client."""
     try:
         config = load_config(config_path)
+        device = str(config['yolo'].get('device', '0'))
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        if device != 'cpu':
+            env["CUDA_VISIBLE_DEVICES"] = device
+            
         client_cmd = f"{sys.executable} client.py --cid {client_id} --config {config_path}"
-        logger.info(f"Starting client {client_id}...")
-        return run_command(client_cmd, wait=False, log_prefix=f"[CLIENT-{client_id}] ")
+        logger.info(f"Starting client {client_id} on GPU {device}...")
+        
+        process = subprocess.Popen(
+            client_cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
+            env=env
+        )
+        
+        # Monitor output in a thread
+        def stream_output(pipe, log_prefix):
+            for line in iter(pipe.readline, ''):
+                logger.info(f"{log_prefix}{line.strip()}")
+            pipe.close()
+            
+        threading.Thread(target=stream_output, args=(process.stdout, f"[CLIENT-{client_id}] "), daemon=True).start()
+        threading.Thread(target=stream_output, args=(process.stderr, f"[CLIENT-{client_id}] "), daemon=True).start()
+        
+        processes.append(process)
+        return process, None
     except Exception as e:
         logger.error(f"Failed to start client {client_id}: {e}", exc_info=True)
         raise
@@ -304,7 +360,7 @@ def monitor_processes(processes: List[subprocess.Popen], timeout: int = 5) -> bo
                     logger.error(f"Process failed with return code {process.returncode}")
                     return False
             except subprocess.TimeoutExpired:
-                logger.warning("Process timeout, but continuing to monitor...")
+                pass # Normal behavior for long-running processes
         return True
     except Exception as e:
         logger.error(f"Error monitoring processes: {e}")
@@ -368,21 +424,15 @@ def main():
         # Give server time to start
         time.sleep(5)
         
-        # Start clients in parallel
+        # Start clients with a stagger
         logger.info(f"Starting {args.num_clients} clients...")
         client_processes = []
-        with ThreadPoolExecutor(max_workers=args.num_clients) as executor:
-            futures = [
-                executor.submit(start_client, i + 1, args.config)
-                for i in range(args.num_clients)
-            ]
-            
-            for future in as_completed(futures):
-                try:
-                    process, _ = future.result()
-                    client_processes.append(process)
-                except Exception as e:
-                    logger.error(f"Client failed to start: {e}")
+        for i in range(args.num_clients):
+            process, _ = start_client(i + 1, args.config)
+            client_processes.append(process)
+            if i < args.num_clients - 1:
+                logger.info("Waiting 5 seconds before starting next client...")
+                time.sleep(5)
         
         # Monitor processes
         logger.info("All processes started. Monitoring...")
